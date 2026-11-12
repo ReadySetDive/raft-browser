@@ -53,6 +53,11 @@
   .node.devanagari text { font: 600 15px var(--deva); }
   .node text .uses { font-weight: 400; fill: var(--muted); }
   .node text.badge { font: 600 10px var(--mono); fill: var(--muted); text-anchor: middle; }
+  /* Zoomed out, text keeps a readable size on screen; the culling decides which labels fit. */
+  #graph .elabel text { font-size: calc(11px * var(--text-k, 1)); }
+  #graph .node text { font-size: calc(13px * var(--text-k, 1)); }
+  #graph .node.devanagari text { font-size: calc(15px * var(--text-k, 1)); }
+  #graph .node text.badge { font-size: calc(10px * var(--text-k, 1)); }
   .node.out text { fill: var(--muted); font-weight: 400; }
 
   aside { grid-column: 2; grid-row: 1 / 4; overflow-y: auto; border-left: 1px solid var(--line); background: var(--surface); padding: 12px; }
@@ -92,6 +97,8 @@
   body.story-mode #graph { visibility: hidden; }
   body.story-mode #fit { visibility: hidden; }
   #story-graph-wrap { position: sticky; top: 0; height: var(--story-height, 70vh); }
+  #story-zoom { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; z-index: 2; }
+  #story-zoom button { min-width: 32px; padding: 2px 8px; }
   #story-graph { width: 100%; height: 100%; display: block; }
   #cards { padding-block: calc(var(--story-height, 70vh) * .45) calc(var(--story-height, 70vh) * .5); display: grid;
            gap: calc(var(--story-height, 70vh) * .75); align-content: start; }
@@ -196,6 +203,7 @@
       <g id="s-nodes"></g>
       <g id="s-labels"></g>
     </svg>
+    <div id="story-zoom"><button data-zoom="1.6" title="Zoom in">+</button><button data-zoom="0.625" title="Zoom out">−</button><button data-zoom="fit">Fit</button></div>
   </div>
   <div id="cards"></div>
 </section>
@@ -745,9 +753,57 @@ function style() {
   const sizes = rafts.map(r => r.spellings.length);
   $("summary").textContent = `${graph.tangle.spellings.length} spellings → ${rafts.length} raft${rafts.length === 1 ? "" : "s"}` +
     `${sizes.length ? ` (sizes ${sizes.slice(0, 8).join(", ")}${sizes.length > 8 ? ", …" : ""})` : ""}, ${out} dropped`;
+  scheduleCull();
 }
 
-function setView() { $("graph").setAttribute("viewBox", view.join(" ")); }
+function setView() { $("graph").setAttribute("viewBox", view.join(" ")); scheduleCull(); }
+
+// ---------- Labels: only those big enough to read and clear of each other ----------
+
+const MIN_FONT_PX = 9, MAX_LABELLED_LINKS = 150, MIN_NATURAL_FONT_PX = 4;
+const overlaps = (a, b) => a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+const labelWidth = (text, font) => text.textContent.length * font * (isDevanagari(text.textContent) ? .7 : .62);
+const byImportance = (a, b) => b.member - a.member || b.weight - a.weight;
+function throttled(fn, ms = 60) {
+  let timer = null;
+  return () => { timer ??= setTimeout(() => { timer = null; fn(); }, ms); };
+}
+
+// Greedy by importance: node labels first (raft members, then heavier spellings), then edge labels (larger counts).
+// A label shows only when it is on screen and its box overlaps none already placed; a null box never shows.
+function placeLabels(nodeLabels, edgeLabels, bounds) {
+  const placed = [];
+  // With this many links on screen their labels would be noise even where they fit.
+  if (edgeLabels.filter(l => l.box && overlaps(l.box, bounds)).length > MAX_LABELLED_LINKS) for (const l of edgeLabels) l.box = null;
+  for (const label of [...nodeLabels.sort(byImportance), ...edgeLabels.sort(byImportance)]) {
+    label.show = !!label.box && overlaps(label.box, bounds) && !placed.some(box => overlaps(box, label.box));
+    if (label.show) placed.push(label.box);
+    label.el.style.display = label.show ? "" : "none";
+  }
+}
+
+function cull() {
+  if (!graph?.layout) return;
+  const rect = $("graph").getBoundingClientRect(), scale = rect.width / view[2], place = graph.layout.place;
+  const toScreen = id => { const [x, y] = place.get(id); return [(x - view[0]) * scale, (y - view[1]) * scale]; };
+  // Text is enlarged to at least MIN_FONT_PX on screen; zoomed out so far that it would have been tiny, no labels at all.
+  const textK = Math.max(1, MIN_FONT_PX / (11 * scale));
+  $("graph").style.setProperty("--text-k", textK);
+  const readable = () => 11 * scale >= MIN_NATURAL_FONT_PX;
+  const fontPx = font => font * textK * scale;
+  const nodeLabels = graph.nodes.map(n => {
+    const [x, y] = toScreen(n.id), left = x + (n.r + 4) * scale, half = fontPx(13) * .62;
+    return { el: n.text, member: +raftOf.has(n.name), weight: graph.tangle.produced.get(n.name) || 0,
+             box: readable() ? [left, y - half, left + labelWidth(n.text, fontPx(13)), y + half] : null };
+  });
+  const edgeLabels = graph.labels.map(l => {
+    const [x, y] = toScreen(l.id), half = labelWidth(l.text, fontPx(11)) / 2, rise = fontPx(11) * .64;
+    return { el: l.text, member: 0, weight: l.link.count, box: readable() ? [x - half, y - rise, x + half, y + rise] : null };
+  });
+  placeLabels(nodeLabels, edgeLabels, [0, 0, rect.width, rect.height]);
+  for (const n of graph.nodes) n.badge.style.display = n.text.style.display;
+}
+const scheduleCull = throttled(cull);
 
 // A small tangle is blown up at most 1.6 times.
 function fit() {
@@ -960,6 +1016,7 @@ function edgeTarget(i, s) {
 
 function render(data) {
   story = data;
+  storyZoom = { k: 1, x: 0, y: 0 };
   // The cards' spacing must be right before the scroll position is read.
   document.body.style.setProperty("--story-height", `${$("story").clientHeight}px`);
   for (const id of ["s-edges", "s-nodes", "s-labels"]) $(id).replaceChildren();
@@ -1043,11 +1100,13 @@ function animateTo(next) {
   // Paint the starting frame now, so an arrival is never shown at its final spot before the first animation frame.
   step(0, phases, nodeFrom, nodeTo, edgeFrom, edgeTo);
   draw();
+  storyCull();
   const tick = now => {
     const progress = clamp((now - start) / phases.duration);
     step(progress, phases, nodeFrom, nodeTo, edgeFrom, edgeTo);
     draw();
     if (progress < 1) frame = requestAnimationFrame(tick);
+    else storyCull();
   };
   frame = requestAnimationFrame(tick);
 }
@@ -1078,22 +1137,52 @@ function step(progress, phases, nodeFrom, nodeTo, edgeFrom, edgeTo) {
   });
 }
 
+// Room on the right for the rightmost label, which sits right of its node.
+const STORY_PAD = { left: 30, right: 130, top: 30, bottom: 30 };
+// One scale for both axes: the layout is in points with labels kept apart at scale 1, so stretching or shrinking an
+// axis on its own would push labels into each other. Capped so a small tangle doesn't balloon.
+const storyScale = box => Math.min((box.width - STORY_PAD.left - STORY_PAD.right) / story.extent.width,
+                                   (box.height - STORY_PAD.top - STORY_PAD.bottom) / story.extent.height, 2);
+
 function screen({ x, y }, box) {
-  // Room on the right for the rightmost label, which sits right of its node.
-  const pad = { left: 30, right: 130, top: 30, bottom: 30 };
-  const width = box.width - pad.left - pad.right, height = box.height - pad.top - pad.bottom;
-  // One scale for both axes: the layout is in points with labels kept apart at scale 1, so stretching or shrinking an
-  // axis on its own would push labels into each other. Capped so a small tangle doesn't balloon.
-  const scale = Math.min(width / story.extent.width, height / story.extent.height, 2);
+  const pad = STORY_PAD, width = box.width - pad.left - pad.right, height = box.height - pad.top - pad.bottom;
+  const scale = storyScale(box);
+  // Zoom spreads the nodes apart while text keeps its size, so zooming in makes room for more labels.
   return {
-    x: pad.left + (width - story.extent.width * scale) / 2 + x * scale,
-    y: pad.top + (height - story.extent.height * scale) / 2 + y * scale,
+    x: (pad.left + (width - story.extent.width * scale) / 2 + x * scale) * storyZoom.k + storyZoom.x,
+    y: (pad.top + (height - story.extent.height * scale) / 2 + y * scale) * storyZoom.k + storyZoom.y,
   };
 }
 
+let storyZoom = { k: 1, x: 0, y: 0 };
+function zoomStory(factor, [px, py]) {
+  storyZoom = { k: storyZoom.k * factor, x: px - (px - storyZoom.x) * factor, y: py - (py - storyZoom.y) * factor };
+  draw();
+  scheduleStoryCull();
+}
+
+function storyCull() {
+  const box = $("story-graph").getBoundingClientRect();
+  const nodeLabels = story.at.map((node, i) => {
+    const text = story.nodeEls[i].text, left = node.x + node.r + 4;
+    return { el: text, member: +raftOf.has(story.nodes[i][0]), weight: node.w,
+             box: node.o > .05 ? [left, node.y - 8, left + labelWidth(text, 13), node.y + 8] : null };
+  });
+  const edgeLabels = story.edges.flatMap((edge, i) => ["ab", "ba"].filter(d => edge[d]).map(d => {
+    const text = story.edgeEls[i][d], [x, y] = story.labelAt[i][d], half = labelWidth(text, 11) / 2;
+    return { el: text, member: 0, weight: edge[d][0], box: shownEdges[i][d] > .05 ? [x - half, y - 7, x + half, y + 7] : null };
+  }));
+  placeLabels(nodeLabels, edgeLabels, [0, 0, box.width, box.height]);
+}
+const scheduleStoryCull = throttled(() => story && storyCull());
+
 function draw() {
   const box = $("story-graph").getBoundingClientRect();
-  const at = shown.map(node => ({ ...node, ...screen(node, box) }));
+  // Circles shrink with the layout when it is squeezed below its natural size, so a big tangle stays a picture, not a blot.
+  const shrink = Math.min(1, storyScale(box) * storyZoom.k);
+  const at = shown.map(node => ({ ...node, r: node.r * shrink, ...screen(node, box) }));
+  story.at = at;
+  story.labelAt = [];
   at.forEach((node, i) => {
     const element = story.nodeEls[i];
     element.g.setAttribute("transform", `translate(${node.x.toFixed(1)} ${node.y.toFixed(1)})`);
@@ -1114,11 +1203,14 @@ function draw() {
     element.line.setAttribute("x1", x1); element.line.setAttribute("y1", y1);
     element.line.setAttribute("x2", x2); element.line.setAttribute("y2", y2);
     element.line.style.opacity = shownEdges[i].line.toFixed(3);
+    // Thinner lines, and so smaller arrowheads, when the circles have shrunk.
+    element.line.style.strokeWidth = (1.6 * Math.max(shrink, .35)).toFixed(2);
     // Each direction's label sits nearer the arrowhead it describes.
     const point = t => [x1 + (x2 - x1) * t, y1 + (y2 - y1) * t];
     const [abX, abY] = point(edge.ba ? .7 : .5), [baX, baY] = point(edge.ab ? .3 : .5);
     element.ab.setAttribute("x", abX); element.ab.setAttribute("y", abY);
     element.ba.setAttribute("x", baX); element.ba.setAttribute("y", baY);
+    story.labelAt[i] = { ab: [abX, abY], ba: [baX, baY] };
     element.ab.style.opacity = shownEdges[i].ab.toFixed(3);
     element.ba.style.opacity = shownEdges[i].ba.toFixed(3);
   });
@@ -1138,10 +1230,36 @@ function stageFromScroll() {
 }
 
 $("story").addEventListener("scroll", () => story && setStage(stageFromScroll()), { passive: true });
+// One finger scrolls the cards, so touch zooms with the buttons; a mouse drags to pan, and a pinch or ctrl+wheel zooms.
+$("story-zoom").addEventListener("click", e => {
+  const factor = e.target.dataset.zoom, box = $("story-graph").getBoundingClientRect();
+  if (!factor || !story) return;
+  if (factor === "fit") { storyZoom = { k: 1, x: 0, y: 0 }; draw(); scheduleStoryCull(); }
+  else zoomStory(+factor, [box.width / 2, box.height / 2]);
+});
+$("story-graph").addEventListener("wheel", e => {
+  if (!e.ctrlKey || !story) return;
+  e.preventDefault();
+  const box = $("story-graph").getBoundingClientRect();
+  zoomStory(Math.exp(-e.deltaY * .0015), [e.clientX - box.left, e.clientY - box.top]);
+}, { passive: false });
+let storyPan = null;
+$("story-graph").addEventListener("pointerdown", e => {
+  if (e.pointerType !== "mouse" || !story) return;
+  storyPan = { x: e.clientX, y: e.clientY, from: storyZoom };
+  $("story-graph").setPointerCapture(e.pointerId);
+});
+$("story-graph").addEventListener("pointermove", e => {
+  if (!storyPan) return;
+  storyZoom = { ...storyPan.from, x: storyPan.from.x + e.clientX - storyPan.x, y: storyPan.from.y + e.clientY - storyPan.y };
+  draw();
+  scheduleStoryCull();
+});
+for (const type of ["pointerup", "pointercancel"]) $("story-graph").addEventListener(type, () => { storyPan = null; });
 new ResizeObserver(() => {
   if (!$("story").clientHeight) return;
   document.body.style.setProperty("--story-height", `${$("story").clientHeight}px`);
-  if (story) draw();
+  if (story) { draw(); scheduleStoryCull(); }
 }).observe($("story"));
 
 drawPick(); drawRules(); recompute(); refilter();
