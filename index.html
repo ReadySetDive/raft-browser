@@ -783,8 +783,8 @@ function placeLabels(nodeLabels, edgeLabels, bounds) {
 }
 
 function cull() {
-  if (!graph?.layout) return;
-  const rect = $("graph").getBoundingClientRect(), scale = rect.width / view[2], place = graph.layout.place;
+  if (!graph?.shown) return;
+  const rect = $("graph").getBoundingClientRect(), scale = rect.width / view[2], place = graph.shown.place;
   const toScreen = id => { const [x, y] = place.get(id); return [(x - view[0]) * scale, (y - view[1]) * scale]; };
   // Text is enlarged to at least MIN_FONT_PX on screen; zoomed out so far that it would have been tiny, no labels at all.
   const textK = Math.max(1, MIN_FONT_PX / (11 * scale));
@@ -806,8 +806,25 @@ function cull() {
 const scheduleCull = throttled(cull);
 
 // A small tangle is blown up at most 1.6 times.
+// neato leaves big tangles long and thin, so a layout far off the screen's shape is spread along its short side,
+// by at most MAX_STRETCH; only positions move, so circles and text stay round and overlap removal still holds.
+const MAX_STRETCH = 2.5;
+function stretched({ place, extent }, box) {
+  const [x0, y0, x1, y1] = extent;
+  const aspect = (box.width / box.height) / ((x1 - x0) / (y1 - y0));
+  const sx = Math.min(MAX_STRETCH, Math.max(1, aspect)), sy = Math.min(MAX_STRETCH, Math.max(1, 1 / aspect));
+  return { place: new Map([...place].map(([id, [x, y]]) => [id, [x0 + (x - x0) * sx, y0 + (y - y0) * sy]])),
+           extent: [x0, y0, x0 + (x1 - x0) * sx, y0 + (y1 - y0) * sy] };
+}
+
+function fitLayout() {
+  graph.shown = graph.layout && stretched(graph.layout, $("graph").getBoundingClientRect());
+  if (graph.shown) place(graph.shown);
+  fit();
+}
+
 function fit() {
-  const [x0, y0, x1, y1] = graph.layout ? graph.layout.extent : [0, 0, 1, 1], box = $("graph").getBoundingClientRect(), pad = 24;
+  const [x0, y0, x1, y1] = graph.shown ? graph.shown.extent : [0, 0, 1, 1], box = $("graph").getBoundingClientRect(), pad = 24;
   const scale = Math.min(box.width / (x1 - x0 + 2 * pad), box.height / (y1 - y0 + 2 * pad), 1.6);
   view = [(x0 + x1 - box.width / scale) / 2, (y0 + y1 - box.height / scale) / 2, box.width / scale, box.height / scale];
   setView();
@@ -824,10 +841,9 @@ function drawTangle() {
   const layoutKey = `${tangles.indexOf(graph.tangle)} ${applied ? JSON.stringify(steps) : "whole"}`;
   if (!layouts.has(layoutKey)) layouts.set(layoutKey, graph.nodes.length ? layout() : null);
   graph.layout = layouts.get(layoutKey);
-  if (graph.layout) place(graph.layout);
   style();
-  fit();
-  if ($("view").value === "story" && graph.layout) render(buildStory(graph.tangle, graph.layout));
+  fitLayout();
+  if ($("view").value === "story" && graph.layout) render(buildStory(graph.tangle, stretched(graph.layout, storyArea($("story-graph").getBoundingClientRect()))));
 }
 
 $("fit").onclick = () => graph && fit();
@@ -869,7 +885,7 @@ for (const type of ["pointerup", "pointercancel"]) $("graph").addEventListener(t
   if (!pointers.size) $("graph").classList.remove("panning");
   startGesture();
 });
-new ResizeObserver(() => graph && fit()).observe($("graph"));
+new ResizeObserver(() => graph && fitLayout()).observe($("graph"));
 
 // ---------- Story: the tangle taken apart by the rules on screen, one card per step (lifted from the scroll-story artifact) ----------
 
@@ -1137,15 +1153,15 @@ function step(progress, phases, nodeFrom, nodeTo, edgeFrom, edgeTo) {
   });
 }
 
-// Room on the right for the rightmost label, which sits right of its node.
-const STORY_PAD = { left: 30, right: 130, top: 30, bottom: 30 };
+// Room on the right for the rightmost label, which sits right of its node; less on a phone, where width is scarce.
+const storyPad = box => ({ left: 30, right: Math.min(130, box.width * .12), top: 30, bottom: 30 });
+const storyArea = box => { const pad = storyPad(box); return { width: box.width - pad.left - pad.right, height: box.height - pad.top - pad.bottom }; };
 // One scale for both axes: the layout is in points with labels kept apart at scale 1, so stretching or shrinking an
 // axis on its own would push labels into each other. Capped so a small tangle doesn't balloon.
-const storyScale = box => Math.min((box.width - STORY_PAD.left - STORY_PAD.right) / story.extent.width,
-                                   (box.height - STORY_PAD.top - STORY_PAD.bottom) / story.extent.height, 2);
+const storyScale = box => Math.min(storyArea(box).width / story.extent.width, storyArea(box).height / story.extent.height, 2);
 
 function screen({ x, y }, box) {
-  const pad = STORY_PAD, width = box.width - pad.left - pad.right, height = box.height - pad.top - pad.bottom;
+  const pad = storyPad(box), { width, height } = storyArea(box);
   const scale = storyScale(box);
   // Zoom spreads the nodes apart while text keeps its size, so zooming in makes room for more labels.
   return {
